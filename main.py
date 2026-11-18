@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""btc-race-24h entry: regime-filtered SMA crossover with trend-strength sizing.
+"""btc-race-24h entry: regime-filtered SMA crossover with half-stake sizing.
 
 Approach
 --------
@@ -33,76 +33,104 @@ from makefun_bars import run  # noqa: E402
 FAST_SPAN = 50
 SLOW_SPAN = 200
 STAKE = 0.50
-MIN_NOTIONAL = 1_000_000
 MAX_SLIPPAGE_BPS = 100
 SYMBOL = 'CBBTC'
-
-caps = {'max_weight_bps': 10000, 'max_orders_per_bar': 4, 'max_open_positions': 1}
+DEFAULT_MIN_NOTIONAL = 1_000_000
 
 closes = []
-held = False
+pending_buy = False
+pending_sell = False
 
 
-def sma(vals, span):
+def sma(values, span):
     """Simple moving average, None until the window is full."""
-    if len(vals) < span:
+    if len(values) < span:
         return None
-    return sum(vals[-span:]) / span
+    return sum(values[-span:]) / span
+
+
+def caps(state):
+    """The caps the harness enforces, read from the hello."""
+    return state.hello.get('caps') or {}
+
+
+def min_notional(state):
+    """The smallest order the market accepts, in quote units."""
+    fees = state.hello.get('fees') or {}
+    value = fees.get('min_notional_quote_units')
+    return int(value) if value is not None else DEFAULT_MIN_NOTIONAL
+
+
+def regime(state):
+    """1 while the fast SMA is above the slow one, else 0."""
+    fast = sma(closes, FAST_SPAN)
+    slow = sma(closes, SLOW_SPAN)
+    if fast is None or slow is None or slow == 0:
+        return 0
+    return 1 if fast > slow else 0
+
+
+def stake(state):
+    """Half the account, clipped to the cash on hand and to the weight cap.
+
+    The paired bootstrap measured 0.4 / 0.5 / 0.6: half beat buy-and-hold on
+    79% of resampled windows with a 29% worst-case drawdown, against 35% at 0.6.
+    """
+    notional = int(state.equity * STAKE)
+    notional = min(notional, state.cash)
+    notional = min(notional, state.weight_room(SYMBOL))
+    return notional
 
 
 def on_hello(state):
-    """Read the caps the harness actually enforces."""
-    got = (state.hello.get('caps') or {})
-    for k in caps:
-        if k in got:
-            caps[k] = got[k]
-
-
-def signal():
-    """1 while the fast SMA is above the slow one, else 0."""
-    f = sma(closes, FAST_SPAN)
-    s = sma(closes, SLOW_SPAN)
-    if f is None or s is None or s == 0:
-        return 0
-    return 1 if f > s else 0
-
-
-def size_fraction():
-    """Half the account, capped by the harness weight limit.
-
-    The paired bootstrap measured 0.4 / 0.5 / 0.6: half beat buy-and-hold on 79%
-    of resampled windows with a 29% worst-case drawdown, against 35% at 0.6.
-    """
-    return min(STAKE, caps['max_weight_bps'] / 10000.0)
+    """Nothing to prepare: every cap and fee is read from the hello when used."""
+    return None
 
 
 def on_batch(state, batch):
     """Decide orders on each bar's close; the fills land on the next bar's open."""
-    global held, closes
+    global pending_buy, pending_sell
+
+    for bar in batch.get('bars') or []:
+        if bar.get('symbol') == SYMBOL:
+            closes.append(int(bar['c']))
+
+    # An order decided on the previous batch has now been filled or rejected and
+    # the account shows it, so the pending flags have served their purpose.
+    pending_buy = False
+    pending_sell = False
+
+    if state.warming_up:
+        return []
+
+    position = state.positions.get(SYMBOL)
+    signal = regime(state)
     orders = []
-    for bar in batch.get('bars', []):
-        closes.append(int(bar['c']))
-        sig = signal()
-        position = state.positions.get(SYMBOL)
-        if sig == 1 and not held and position is None:
-            notional = int(state.cash * size_fraction())
-            if notional >= MIN_NOTIONAL:
-                orders.append({'side': 'buy', 'symbol': SYMBOL,
-                               'notional_quote_units': notional,
-                               'max_slippage_bps': MAX_SLIPPAGE_BPS})
-                held = True
-        elif sig == 0 and held and position is not None:
+
+    if position is not None:
+        # Long: the death cross closes the position.
+        if signal == 0:
             orders.append({'side': 'sell', 'symbol': SYMBOL, 'qty': position.qty,
                            'max_slippage_bps': MAX_SLIPPAGE_BPS})
-            held = False
-        if len(orders) >= caps['max_orders_per_bar']:
-            break
+            pending_sell = True
+    elif signal == 1:
+        # Flat in an uptrend: take half the account.
+        notional = stake(state)
+        if notional >= min_notional(state):
+            orders.append({'side': 'buy', 'symbol': SYMBOL,
+                           'notional_quote_units': notional,
+                           'max_slippage_bps': MAX_SLIPPAGE_BPS})
+            pending_buy = True
+
+    limit = caps(state).get('max_orders_per_bar')
+    if limit is not None and len(orders) > limit:
+        orders = orders[:limit]
     return orders
 
 
 def on_done(state, done):
     """The harness closes any open position at the last close; nothing to do."""
-    return []
+    return None
 
 
 if __name__ == '__main__':
